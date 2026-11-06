@@ -15,7 +15,7 @@ import {
   type ProviderEditor,
 } from "./src/fusion"
 
-import { buildAuxiliaryRequest, DEFAULT_AUXILIARY_MODEL, DEFAULT_AUXILIARY_UPSTREAM, isAuxiliary, type RequestKind } from "./src/auxiliary"
+import { prepareAuxiliaryBody, auxiliaryKind, auxiliarySession, isAuxiliary, type RequestKind } from "./src/auxiliary"
 
 type ProviderRef = { providerID: string }
 type RequestEvent = { kind?: RequestKind; sessionID: string; model: ProviderRef; request: Request }
@@ -49,10 +49,6 @@ const plugin = {
     const options = context.options ?? {}
     const upstream = stringOption(options, "upstream") ?? process.env.FUSION_UPSTREAM ?? DEFAULT_UPSTREAM
     const tier = stringOption(options, "tier") ?? process.env.FUSION_TIER ?? DEFAULT_TIER
-    const auxiliaryUpstream = stringOption(options, "auxiliaryUpstream") ?? process.env.FUSION_AUXILIARY_UPSTREAM ?? DEFAULT_AUXILIARY_UPSTREAM
-    const auxiliaryModel = stringOption(options, "auxiliaryModel") ?? process.env.FUSION_AUXILIARY_MODEL ?? DEFAULT_AUXILIARY_MODEL
-    // Deliberately separate from FUSION_ACCESS_TOKEN (which may be a pool run credential).
-    const auxiliaryApiKey = stringOption(options, "auxiliaryApiKey") ?? process.env.FUSION_AUXILIARY_API_KEY
     const timeoutMs = numberOption(options, "timeoutMs") ?? 120_000
     const configured = stringOption(options, "tokenFile") ?? process.env.FUSION_TOKEN_FILE
     const tokenFile = configured
@@ -77,7 +73,10 @@ const plugin = {
     let outputLimit = FUSION_OUTPUT_LIMIT
     await context.provider.transform((editor) => upsertProvider(editor, upstream, outputLimit))
     await context.session.hook("compaction", event => {
-      if (event.model.providerID === PROVIDER_ID) router.invalidateSession(event.sessionID)
+      if (event.model.providerID === PROVIDER_ID) {
+        router.invalidateSession(event.sessionID)
+        router.invalidateSession(auxiliarySession(event.sessionID, "compaction"))
+      }
     }, { providerID: PROVIDER_ID })
     await context.session.hook(
       "http.request",
@@ -90,29 +89,32 @@ const plugin = {
           return
         }
         if (typeof body !== "object" || body === null || (body as { model?: unknown }).model !== MODEL_ID) return
-        if (isAuxiliary(event.kind)) {
-          event.request = buildAuxiliaryRequest(event.request, body as Record<string, unknown>, {
-            upstream: auxiliaryUpstream, model: auxiliaryModel, apiKey: auxiliaryApiKey, kind: event.kind,
-          })
-          return
+        const auxiliary = isAuxiliary(event.kind)
+        const kind = auxiliary ? auxiliaryKind(event.kind) : "primary"
+        const sessionID = auxiliary ? auxiliarySession(event.sessionID, event.kind) : event.sessionID
+        const requestBody = auxiliary ? prepareAuxiliaryBody(body as Record<string, unknown>, event.kind) : body as Record<string, unknown>
+        let input
+        try { input = extractInput(requestBody) } catch (error) {
+          if (!auxiliary) throw error
+          input = { prompt: typeof requestBody.instructions === "string" ? requestBody.instructions.slice(0, 8000) : "Summarize this conversation.", hasImage: false }
         }
-        const input = extractInput(body)
         const currentToken = await token()
         router.setToken(currentToken)
-        const route = await router.route(event.sessionID, input.prompt, input.hasImage)
+        const route = await router.route(sessionID, input.prompt, input.hasImage, kind)
         const selectedOutputLimit = route.selected_model.limits!.max_output_tokens
-        if (outputLimit !== selectedOutputLimit) {
+        if (!auxiliary && outputLimit !== selectedOutputLimit) {
           outputLimit = selectedOutputLimit
           await context.provider.reload?.()
         }
         event.request = buildUpstreamRequest(
           event.request,
-          prepareResponsesBody(body as Record<string, unknown>, route),
+          prepareResponsesBody(requestBody, route),
           route,
           currentToken,
           upstream,
-          event.sessionID,
+          sessionID,
           router.reuse(route),
+          kind,
         )
       },
       { providerID: PROVIDER_ID },
@@ -121,12 +123,9 @@ const plugin = {
       "http.response",
       async (event) => {
         if (event.model.providerID !== PROVIDER_ID) return
-        if (isAuxiliary(event.kind)) {
-          event.response = await normalizeHttpResponse(event.response)
-          return
-        }
-        if (!event.response.ok) router.invalidateSession(event.sessionID)
-        event.response = await normalizeHttpResponse(event.response, () => router.invalidateSession(event.sessionID))
+        const sessionID = isAuxiliary(event.kind) ? auxiliarySession(event.sessionID, event.kind) : event.sessionID
+        if (!event.response.ok) router.invalidateSession(sessionID)
+        event.response = await normalizeHttpResponse(event.response, () => router.invalidateSession(sessionID))
       },
       { providerID: PROVIDER_ID },
     )

@@ -54,7 +54,7 @@ Select `copilot-fusion-direct/fusion`, or keep it as the `model` in `opencode.js
 - The first primary request calls `POST /auto` with `fusion: true` and `tier: balance`.
 - The selected model and Fusion session token are sticky per conversation, including new user prompts. Concurrent requests share one `/auto` call; follow-ups use `X-Initiator: agent`.
 - Compaction, credential rotation, failed inference, expiry, or an image requiring a vision-capable model reset the route. During refresh, `/auto` 429/5xx responses reuse the previous route only while it is still valid and compatible.
-- Title, generate, and compaction requests never call `/auto` or use the shared pool. They use the runner's free `deepseek-v4.1-flash-free` model via OpenCode Console's documented Responses endpoint (all text models support it). Original hook identity, request cancellation, HTTP errors and `Retry-After` remain available to the runner's compaction budget.
+- Title, generate/summaries, small-model and compaction calls use Fusion too, with independent per-kind sticky sessions and explicit request-kind headers on selection and generation. Shared-pool admission prefers another healthy contributor; own-token runs use their own Fusion. No auxiliary free-provider fallback. Compaction cancellation/retry budgets remain effective.
 - Routed primary requests omit `temperature`, which some selected models reject.
 - It forwards the original Responses payload, including tools and tool results, to `/responses`.
 - It executes no tools. OpenCode runs its native tools and sends their results back through the same route.
@@ -78,9 +78,9 @@ Pass options through the plugin entry when needed:
 }
 ```
 
-Supported options: `tokenFile`, `upstream`, `tier`, `timeoutMs`, `auxiliaryUpstream`, `auxiliaryModel`, and `auxiliaryApiKey`. Environment equivalents are `FUSION_TOKEN_FILE`, `FUSION_ACCESS_TOKEN`, `FUSION_UPSTREAM`, `FUSION_TIER`, `FUSION_AUXILIARY_UPSTREAM`, `FUSION_AUXILIARY_MODEL`, and `FUSION_AUXILIARY_API_KEY`.
+Supported options: `tokenFile`, `upstream`, `tier`, and `timeoutMs`. Environment equivalents are `FUSION_TOKEN_FILE`, `FUSION_ACCESS_TOKEN`, `FUSION_UPSTREAM`, and `FUSION_TIER`.
 
-`FUSION_UPSTREAM` may be the shared-pool proxy prefix and `FUSION_ACCESS_TOKEN` its run credential. Auxiliary calls use a separate endpoint (default `https://opencode.ai/inference/openai/v1`) and a separate API key (default `public`). **Fusion credentials, cookies, and encrypted reasoning are never forwarded there.** Auxiliary input preserves conversational text and tool-call/result history; these calls do not execute tools or transfer image data. The genuine OpenCode User-Agent/client headers are retained, since free chat models require OpenCode. If your deployment uses a different free-model endpoint, configure the auxiliary options explicitly.
+`FUSION_UPSTREAM` may be the shared-pool proxy prefix and `FUSION_ACCESS_TOKEN` its run credential. Auxiliaries use that same authorized Fusion transport, never the old free auxiliary endpoint/options. Primary and auxiliary cache keys are separate, preventing title/summary failures from invalidating primary sticky routing. Primary encrypted reasoning and images are stripped from auxiliary text requests; tools are not enabled. Title output stays capped at512 and other auxiliaries at8000, additionally bounded by the selected model catalog cap.
 
 ## Release assets
 
@@ -131,3 +131,6 @@ FUSION_SYNTHETIC_MODEL=luna-synthetic-low-limit FUSION_SYNTHETIC_OUTPUT_LIMIT=16
 - No token refresh yet.
 - No WebSocket transport or Copilot CLI escalation policy.
 - The `/auto` endpoint is a private Copilot surface and can change.
+
+## Auxiliary routing release (2026-11-06)
+The older synthetic harness descriptions above refer to the previous off-Fusion auxiliary policy. This release intentionally changes that policy. No suites or smoke runs were executed for this release, per the owner's low-usage request; only build checks and brief natural-traffic observation.

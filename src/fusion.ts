@@ -197,7 +197,7 @@ export class FusionRouter {
     return reused
   }
 
-  async route(sessionID: string, prompt: string, hasImage = false): Promise<FusionRoute> {
+  async route(sessionID: string, prompt: string, hasImage = false, requestKind = "primary"): Promise<FusionRoute> {
     const key = routeKey(sessionID)
     this.prune()
     const pending = this.inflight.get(key)
@@ -205,14 +205,14 @@ export class FusionRouter {
       const selected = await pending
       // An image arriving during a text-only flight must not inherit a non-vision pick.
       return hasImage && selected.selected_model.vision !== true
-        ? this.route(sessionID, prompt, true)
+        ? this.route(sessionID, prompt, true, requestKind)
         : selected
     }
     const cached = this.routes.get(key)
     const compatible = !hasImage || cached?.selected_model.vision === true
     if (cached && compatible && cached.expires_at > this.now() + 30) return cached
 
-    const promise = this.select(sessionID, prompt, hasImage, compatible ? cached : undefined).then(route => {
+    const promise = this.select(sessionID, prompt, hasImage, compatible ? cached : undefined, requestKind).then(route => {
       if (this.inflight.get(key) === promise) {
         if (this.routes.size >= this.maxRoutes && !this.routes.has(key)) {
           const oldest = this.routes.keys().next().value
@@ -228,10 +228,10 @@ export class FusionRouter {
     return promise
   }
 
-  private async select(sessionID: string, prompt: string, hasImage: boolean, previous?: FusionRoute): Promise<FusionRoute> {
+  private async select(sessionID: string, prompt: string, hasImage: boolean, previous?: FusionRoute, requestKind = "primary"): Promise<FusionRoute> {
     const response = await this.fetchImpl(`${this.upstream}/auto`, {
       method: "POST",
-      headers: this.headers(sessionID),
+      headers: this.headers(sessionID, requestKind),
       body: JSON.stringify({
         prompt,
         has_image: hasImage,
@@ -345,7 +345,7 @@ export class FusionRouter {
     for (const [key, route] of this.routes) if (route.expires_at <= threshold) this.routes.delete(key)
   }
 
-  private headers(sessionID: string): Record<string, string> {
+  private headers(sessionID: string, requestKind = "primary"): Record<string, string> {
     return {
       Authorization: `Bearer ${this.token}`,
       "Content-Type": "application/json",
@@ -355,6 +355,7 @@ export class FusionRouter {
       "X-GitHub-Api-Version": "2026-08-01",
       "OpenAI-Intent": "conversation-agent",
       "X-Initiator": "user",
+      "X-Fusion-Request-Kind": requestKind,
       "X-Interaction-Id": sessionID,
       "X-Client-Session-Id": sessionID,
     }
@@ -369,10 +370,13 @@ export function buildUpstreamRequest(
   upstream: string,
   sessionID: string,
   reused: boolean,
+  requestKind = "primary",
 ): Request {
   const headers = new Headers(original.headers)
   headers.delete("authorization")
   headers.delete("x-api-key")
+  headers.delete("cookie")
+  headers.delete("proxy-authorization")
   headers.delete("content-length")
   headers.delete("copilot-session-token")
   headers.set("authorization", `Bearer ${token}`)
@@ -383,6 +387,7 @@ export function buildUpstreamRequest(
   headers.set("x-github-api-version", "2026-08-01")
   headers.set("openai-intent", "conversation-agent")
   headers.set("x-initiator", reused ? "agent" : "user")
+  headers.set("x-fusion-request-kind", requestKind)
   headers.set("x-interaction-id", sessionID)
   headers.set("x-client-session-id", sessionID)
   return new Request(new URL("/responses", upstream), {
