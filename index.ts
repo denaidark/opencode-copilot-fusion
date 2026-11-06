@@ -4,6 +4,7 @@ import {
   DEFAULT_TIER,
   DEFAULT_UPSTREAM,
   FusionRouter,
+  FUSION_OUTPUT_LIMIT,
   MODEL_ID,
   PROVIDER_ID,
   buildUpstreamRequest,
@@ -24,7 +25,7 @@ type HookOptions = { providerID?: string }
 type Context = {
   readonly options: Readonly<Record<string, unknown>>
   readonly location: { readonly directory: string }
-  readonly provider: { transform(editor: (value: ProviderEditor) => void): Promise<unknown> }
+  readonly provider: { transform(editor: (value: ProviderEditor) => void): Promise<unknown>; reload?(): Promise<void> }
   readonly session: {
     hook(name: "compaction", callback: (event: { sessionID: string; model: ProviderRef }) => Promise<void> | void, options?: HookOptions): Promise<unknown>
     hook(name: "http.request", callback: (event: RequestEvent) => Promise<void> | void, options?: HookOptions): Promise<unknown>
@@ -73,7 +74,8 @@ const plugin = {
     }
 
     router.setToken(await token())
-    await context.provider.transform((editor) => upsertProvider(editor, upstream))
+    let outputLimit = FUSION_OUTPUT_LIMIT
+    await context.provider.transform((editor) => upsertProvider(editor, upstream, outputLimit))
     await context.session.hook("compaction", event => {
       if (event.model.providerID === PROVIDER_ID) router.invalidateSession(event.sessionID)
     }, { providerID: PROVIDER_ID })
@@ -98,6 +100,11 @@ const plugin = {
         const currentToken = await token()
         router.setToken(currentToken)
         const route = await router.route(event.sessionID, input.prompt, input.hasImage)
+        const selectedOutputLimit = route.selected_model.limits!.max_output_tokens
+        if (outputLimit !== selectedOutputLimit) {
+          outputLimit = selectedOutputLimit
+          await context.provider.reload?.()
+        }
         event.request = buildUpstreamRequest(
           event.request,
           prepareResponsesBody(body as Record<string, unknown>, route),

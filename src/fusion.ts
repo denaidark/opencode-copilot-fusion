@@ -2,11 +2,9 @@ export const PROVIDER_ID = "copilot-fusion-direct"
 export const MODEL_ID = "fusion"
 export const DEFAULT_UPSTREAM = "https://api.githubcopilot.com"
 export const DEFAULT_TIER = "balance"
-// Igor-authorized 2026-11-06 probe: selected mai-code-1.1-flash catalog and
-// /responses both report 128000. Parameter acceptance is not sustained-output evidence.
-export const FUSION_OUTPUT_LIMIT = 128_000
-// Preserve the existing conservative input window; reserve output separately so
-// increasing the output cap cannot make OpenCode compact every turn.
+// Conservative fallback for unavailable catalog metadata, validated against the
+// observed Luna/mai-code routes. A known lower model-specific limit always wins.
+export const FUSION_OUTPUT_LIMIT = 64_000
 export const FUSION_INPUT_LIMIT = 48_000
 
 export class FusionError extends Error {}
@@ -15,6 +13,8 @@ export interface ModelSelection {
   id: string
   supported_endpoints?: string[]
   vision?: boolean
+  limits?: { max_output_tokens: number }
+  output_limit_source?: "model-catalog" | "fallback"
 }
 
 export interface InputAnalysis {
@@ -95,6 +95,8 @@ export interface ProviderEditor {
   readonly models: { set(providerID: string, models: readonly ModelInfo[]): void }
 }
 
+const positiveInteger = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
@@ -132,8 +134,13 @@ export function prepareResponsesBody(body: Record<string, unknown>, route: Fusio
     ? body.include.filter((value): value is string => typeof value === "string")
     : []
   if (!include.includes("reasoning.encrypted_content")) include.push("reasoning.encrypted_content")
-  const { temperature: _temperature, ...rest } = body
-  return { ...rest, model: route.selected_model.id, store: false, include }
+  const cap = route.selected_model.limits?.max_output_tokens
+  if (!cap || !Number.isSafeInteger(cap) || cap < 1) throw new FusionError("Selected model output limit unavailable; refusing unbounded generation")
+  const requested = typeof body.max_output_tokens === "number" && Number.isFinite(body.max_output_tokens) ? body.max_output_tokens : cap
+  // A model cap is a ceiling, not permission to override a smaller request budget.
+  const maxOutput = Math.min(Math.max(1, requested), cap)
+  const { temperature: _temperature, max_output_tokens: _oldMax, ...rest } = body
+  return { ...rest, model: route.selected_model.id, max_output_tokens: maxOutput, store: false, include }
 }
 
 export function routeKey(sessionID: string): string {
@@ -151,6 +158,8 @@ export class FusionRouter {
   private token: string
   private readonly inflight = new Map<string, Promise<FusionRoute>>()
   private used = new WeakSet<FusionRoute>()
+  private catalog?: { expires: number; limits: Map<string, number> }
+  private catalogFlight?: Promise<Map<string, number>>
 
   constructor(options: RouterOptions) {
     this.token = options.token
@@ -172,6 +181,8 @@ export class FusionRouter {
     // Detached /auto calls may finish, but cannot repopulate this cache.
     this.inflight.clear()
     this.used = new WeakSet()
+    this.catalog = undefined
+    this.catalogFlight = undefined
   }
 
   invalidateSession(sessionID: string) {
@@ -279,7 +290,54 @@ export class FusionRouter {
     if (route.expires_at <= this.now() + 30) {
       throw new FusionError("Fusion returned no valid expiry")
     }
+    // A pool proxy may enrich selected_model with limits from this contributor's
+    // /models inventory. Otherwise read /models on the SAME configured upstream,
+    // with the SAME credential. Never bypass the pool with its run capability.
+    const inlineLimits = isRecord(selected.capabilities) && isRecord(selected.capabilities.limits)
+      ? selected.capabilities.limits : isRecord(selected.limits) ? selected.limits : undefined
+    const inlineCap = inlineLimits?.max_output_tokens
+    const catalogCap = this.catalog?.expires && this.catalog.expires > this.now()
+      ? this.catalog.limits.get(route.selected_model.id) : undefined
+    const knownCap = positiveInteger(inlineCap) ? Math.min(inlineCap, catalogCap ?? inlineCap)
+      : (await this.modelLimits()).get(route.selected_model.id)
+    route.selected_model.limits = { max_output_tokens: positiveInteger(knownCap) ? knownCap : FUSION_OUTPUT_LIMIT }
+    route.selected_model.output_limit_source = positiveInteger(knownCap) ? "model-catalog" : "fallback"
     return route
+  }
+
+  private async modelLimits(): Promise<Map<string, number>> {
+    if (this.catalog && this.catalog.expires > this.now()) return this.catalog.limits
+    if (this.catalogFlight) return this.catalogFlight
+    const token = this.token
+    let flight!: Promise<Map<string, number>>
+    flight = (async () => {
+      const response = await this.fetchImpl(`${this.upstream}/models`, {
+        method: "GET", headers: this.headers("model-inventory"), signal: AbortSignal.timeout(Math.min(this.timeoutMs, 15_000)),
+      })
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {})
+        throw new FusionError(`Copilot /models returned HTTP ${response.status}`)
+      }
+      const value: unknown = await response.json()
+      const models = isRecord(value) && Array.isArray(value.data) ? value.data : Array.isArray(value) ? value : []
+      const limits = new Map<string, number>()
+      for (const model of models) {
+        if (!isRecord(model) || typeof model.id !== "string") continue
+        const spec = isRecord(model.capabilities) && isRecord(model.capabilities.limits)
+          ? model.capabilities.limits : isRecord(model.limits) ? model.limits : undefined
+        if (positiveInteger(spec?.max_output_tokens)) limits.set(model.id, Math.min(spec.max_output_tokens, limits.get(model.id) ?? spec.max_output_tokens))
+      }
+      if (this.token === token && this.catalogFlight === flight) this.catalog = { expires: this.now() + 300, limits }
+      return limits
+    })().catch(() => {
+      // Older pool proxies do not expose /models yet. Never bypass them with a
+      // run credential; use the explicitly approved fallback and retry metadata later.
+      const limits = new Map<string, number>()
+      if (this.token === token && this.catalogFlight === flight) this.catalog = { expires: this.now() + 30, limits }
+      return limits
+    }).finally(() => { if (this.catalogFlight === flight) this.catalogFlight = undefined })
+    this.catalogFlight = flight
+    return flight
   }
 
   private prune() {
@@ -453,7 +511,7 @@ export function providerInfo(upstream = DEFAULT_UPSTREAM): ProviderInfo {
   }
 }
 
-export function modelInfo(): ModelInfo {
+export function modelInfo(outputLimit = FUSION_OUTPUT_LIMIT): ModelInfo {
   return {
     id: MODEL_ID,
     modelID: MODEL_ID,
@@ -466,11 +524,11 @@ export function modelInfo(): ModelInfo {
     cost: [],
     status: "active",
     enabled: true,
-    limit: { context: FUSION_INPUT_LIMIT + FUSION_OUTPUT_LIMIT, input: FUSION_INPUT_LIMIT, output: FUSION_OUTPUT_LIMIT },
+    limit: { context: FUSION_INPUT_LIMIT + outputLimit, input: FUSION_INPUT_LIMIT, output: outputLimit },
   }
 }
 
-export function upsertProvider(editor: ProviderEditor, upstream = DEFAULT_UPSTREAM) {
+export function upsertProvider(editor: ProviderEditor, upstream = DEFAULT_UPSTREAM, outputLimit = FUSION_OUTPUT_LIMIT) {
   if (editor.get(PROVIDER_ID)) {
     editor.update(PROVIDER_ID, (provider) => {
       provider.name = "Copilot Fusion Direct"
@@ -478,8 +536,8 @@ export function upsertProvider(editor: ProviderEditor, upstream = DEFAULT_UPSTRE
       provider.package = "@opencode/ai/providers/openai/responses"
       provider.settings = { ...provider.settings, baseURL: upstream, apiKey: "opencode-fusion" }
     })
-    editor.models.set(PROVIDER_ID, [modelInfo()])
+    editor.models.set(PROVIDER_ID, [modelInfo(outputLimit)])
     return
   }
-  editor.add({ info: providerInfo(upstream), models: [modelInfo()] })
+  editor.add({ info: providerInfo(upstream), models: [modelInfo(outputLimit)] })
 }

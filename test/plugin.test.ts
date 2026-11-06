@@ -11,7 +11,7 @@ describe("plugin request lifecycle", () => {
     let calls = 0
     globalThis.fetch = (async () => {
       calls++
-      return Response.json({ session_token: "local_synthetic_session", selected_model: { id: "chosen", supported_endpoints: ["/responses"], vision: true }, expires_at: Date.now() / 1000 + 600 })
+      return Response.json({ session_token: "local_synthetic_session", selected_model: { id: "chosen", supported_endpoints: ["/responses"], vision: true, capabilities: { limits: { max_output_tokens: 16384 } } }, expires_at: Date.now() / 1000 + 600 })
     }) as unknown as typeof fetch
     const hooks: Record<string, (event: any) => Promise<void> | void> = {}
     const context: Parameters<typeof plugin.setup>[0] = {

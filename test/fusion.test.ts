@@ -25,7 +25,7 @@ import {
 
 const route = (model = "selected-model", expires = 2_000): FusionRoute => ({
   session_token: "session-token",
-  selected_model: { id: model, supported_endpoints: ["/responses"], vision: true },
+  selected_model: { id: model, supported_endpoints: ["/responses"], vision: true, limits: { max_output_tokens: 128_000 } },
   expires_at: expires,
 })
 
@@ -154,7 +154,7 @@ describe("Fusion routing", () => {
 
   test("never masks auth failures and never reuses non-vision routes for image input", async () => {
     let status = 200, now = 1000
-    const instance = router(async () => status === 200 ? Response.json({ ...route("text", 1100), selected_model: { id: "text", supported_endpoints: ["/responses"], vision: false } }) : new Response("failed", { status }), () => now)
+    const instance = router(async () => status === 200 ? Response.json({ ...route("text", 1100), selected_model: { id: "text", supported_endpoints: ["/responses"], vision: false, limits: { max_output_tokens: 16384 } } }) : new Response("failed", { status }), () => now)
     await instance.route("s", "one")
     status = 429
     await expect(instance.route("s", "image", true)).rejects.toThrow("HTTP 429")
@@ -168,7 +168,7 @@ describe("Fusion routing", () => {
       calls++
       await Bun.sleep(5)
       const vision = JSON.parse(String(init?.body)).has_image
-      return Response.json({ ...route(), selected_model: { id: vision ? "vision" : "text", supported_endpoints: ["/responses"], vision } })
+      return Response.json({ ...route(), selected_model: { id: vision ? "vision" : "text", supported_endpoints: ["/responses"], vision, limits: { max_output_tokens: 16384 } } })
     })
     const [plain, image] = await Promise.all([instance.route("s", "hi"), instance.route("s", "photo", true)])
     expect(plain.selected_model.id).toBe("text")
@@ -184,6 +184,60 @@ describe("Fusion routing", () => {
     finish()
     await pending
     expect(instance.routes.size).toBe(0)
+  })
+
+  test("looks up each selected model's own catalog cap through the configured pool upstream", async () => {
+    const calls: string[] = []
+    const instance = new FusionRouter({ token: "fsp_r_local", upstream: "https://pool.test/api/fusion-pool", now: () => 1000, fetchImpl: async (url, init) => {
+      calls.push(String(url))
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fsp_r_local")
+      if (String(url).endsWith("/models")) return Response.json({ data: [
+        { id: "luna-synthetic", capabilities: { limits: { max_output_tokens: 16384 } } },
+        { id: "mai-synthetic", capabilities: { limits: { max_output_tokens: 128000 } } },
+      ] })
+      const prompt = JSON.parse(String(init?.body)).prompt
+      const selected = route(prompt === "small" ? "luna-synthetic" : "mai-synthetic")
+      delete selected.selected_model.limits
+      return Response.json(selected)
+    } })
+    const small = await instance.route("small-session", "small"), big = await instance.route("big-session", "big")
+    expect(prepareResponsesBody({ max_output_tokens: 128000 }, small).max_output_tokens).toBe(16384)
+    expect(prepareResponsesBody({}, big).max_output_tokens).toBe(128000)
+    expect(prepareResponsesBody({ max_output_tokens: FUSION_OUTPUT_LIMIT }, big).max_output_tokens).toBe(64000)
+    expect(prepareResponsesBody({ max_output_tokens: 1024 }, small).max_output_tokens).toBe(1024)
+    expect(modelInfo(small.selected_model.limits!.max_output_tokens).limit.output).toBe(16384)
+    expect(calls.filter(url => url.endsWith("/models"))).toHaveLength(1)
+    expect(calls.every(url => url.startsWith("https://pool.test/api/fusion-pool/"))).toBe(true)
+  })
+
+  test("uses the approved 64000 fallback only when the selected model catalog cap is unavailable", async () => {
+    const missing = route("unknown"); delete missing.selected_model.limits
+    for (const catalog of [Response.json({ data: [] }), new Response("not exposed", { status: 404 })]) {
+      const instance = router(async url => String(url).endsWith("/models") ? catalog : Response.json(missing))
+      const selected = await instance.route("s", "hi")
+      expect(selected.selected_model.limits?.max_output_tokens).toBe(64000)
+      expect(selected.selected_model.output_limit_source).toBe("fallback")
+    }
+    expect(() => prepareResponsesBody({}, missing)).toThrow("refusing unbounded generation")
+  })
+
+  test("respects inline selected-model catalog limits below the fallback", async () => {
+    const selected = route("small"); selected.selected_model.limits = { max_output_tokens: 4096 }
+    const instance = router(async () => Response.json(selected))
+    const result = await instance.route("s", "hi")
+    expect(prepareResponsesBody({ max_output_tokens: 64000 }, result).max_output_tokens).toBe(4096)
+    expect(result.selected_model.output_limit_source).toBe("model-catalog")
+  })
+
+  test("shares one catalog request across concurrent independent sessions", async () => {
+    let catalogCalls = 0
+    const instance = router(async url => {
+      if (String(url).endsWith("/models")) { catalogCalls++; await Bun.sleep(5); return Response.json({ data: [{ id: "m", capabilities: { limits: { max_output_tokens: 4096 } } }] }) }
+      const selected = route("m"); delete selected.selected_model.limits; return Response.json(selected)
+    })
+    const values = await Promise.all([instance.route("one", "hi"), instance.route("two", "hi")])
+    expect(catalogCalls).toBe(1)
+    expect(values.every(value => value.selected_model.limits?.max_output_tokens === 4096)).toBe(true)
   })
 
   test("bounds the route cache", async () => {
@@ -322,7 +376,7 @@ describe("provider registration", () => {
     expect(added[0].models[0].capabilities.input).toContain("image")
     expect(added[0].models[0].id).toBe(MODEL_ID)
     expect(modelInfo().limit.output).toBe(FUSION_OUTPUT_LIMIT)
-    expect(FUSION_OUTPUT_LIMIT).toBe(128_000)
+    expect(FUSION_OUTPUT_LIMIT).toBe(64_000)
     expect(modelInfo().limit.context).toBeGreaterThanOrEqual(modelInfo().limit.input + modelInfo().limit.output)
     expect(modelInfo().name).toBe("Fusion Standard")
     expect(added[0].info.id).toBe(PROVIDER_ID)

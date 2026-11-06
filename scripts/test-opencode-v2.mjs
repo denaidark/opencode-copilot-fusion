@@ -12,7 +12,8 @@ const repository=path.resolve(path.dirname(new URL(import.meta.url).pathname),'.
 const name=process.argv[3]||new Date().toISOString().replaceAll(/[:.]/g,'-');
 if(!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))throw Error('Use a plain unique result name');
 const out=path.join(root,'results',name);if(fs.existsSync(out))throw Error('Result directory already exists; use a fresh name');fs.mkdirSync(out,{recursive:true});
-const failCompaction=process.argv[4]==='--fail-compaction';
+const failCompaction=process.argv.slice(4).includes('--fail-compaction');
+const noCatalog=process.argv.slice(4).includes('--no-models');
 // Deliberately credential-free: this harness exercises real OpenCode, not live model quality.
 const token='synthetic_mock_contributor_only';
 const upstream='https://api.githubcopilot.com'; // Metadata only; observedFetch below never performs a network fetch.
@@ -23,17 +24,19 @@ const pool=createFusionPool({enabled:()=>true,tokenFor:()=>token,sharingAllowed:
 pool.observe({id:'local-test-contributor'},token,{enabled:true,cause:'ok',upstream});
 capability=pool.issue('local-test-consumer','local-diagnostic-only').credential;if(!capability)throw new Error('Local pool credential unavailable');
 
+const mockModel=process.env.FUSION_SYNTHETIC_MODEL||'fusion-mock';
+const mockOutputCap=Number(process.env.FUSION_SYNTHETIC_OUTPUT_LIMIT||128000);
 let mockSequence=0;
 async function mockUpstream(url,options) {
  await new Promise(resolve=>setTimeout(resolve,150));
- if(url.endsWith('/auto')) return Response.json({session_token:'synthetic_mock_session',selected_model:{id:'fusion-mock',supported_endpoints:['/responses'],vision:true},expires_at:Math.floor(Date.now()/1000)+600});
+ if(url.endsWith('/auto')) return Response.json({session_token:'synthetic_mock_session',selected_model:{id:mockModel,supported_endpoints:['/responses'],vision:true},expires_at:Math.floor(Date.now()/1000)+600});
  const body=JSON.parse(options.body),isCompaction=JSON.stringify((body.input||[]).filter(item=>item.role==='user').at(-1)||'').includes('## Objective')||JSON.stringify((body.input||[]).filter(item=>item.role==='user').at(-1)||'').includes('required summary template'),write=isCompaction?undefined:(body.tools||[]).find(t=>t.name==='write');
  if(isCompaction&&failCompaction)return Response.json({error:{code:'upstream_error',message:'Synthetic temporary compaction failure.'}},{status:503,headers:{'Retry-After':'0'}});
  const input=body.input||[],large=JSON.stringify(input).includes('Create large.html now'),filename=large?'large.html':'index.html';
  const called=input.some(item=>item.type==='function_call'&&item.name==='write'&&String(item.arguments).includes(filename));
  const id='resp_mock_'+(++mockSequence),events=[],output=[];
  const emit=(type,fields)=>events.push({type,sequence_number:events.length,...fields});
- emit('response.created',{response:{id,status:'in_progress',object:'response',model:'fusion-mock',output:[]}});
+ emit('response.created',{response:{id,status:'in_progress',object:'response',model:mockModel,output:[]}});
  if(write&&!called) {
    const content='<!doctype html><meta charset="utf-8"><title>Target game</title><button id="target">Click target</button><p id="score">0</p><button onclick="n=0;score.textContent=n">Restart</button><script>let n=0;target.onclick=()=>{score.textContent=++n;target.style.marginLeft=Math.random()*80+"vw"}</script>'+ (large?'<!--'+('large mock transport payload '.repeat(6000))+'-->':'');
    const properties=write.parameters?.properties||{},args={};
@@ -53,13 +56,13 @@ async function mockUpstream(url,options) {
    emit('response.output_text.done',{output_index:0,item_id:item.id,content_index:0,text});
    emit('response.output_item.done',{output_index:0,item});output.push(item);
  }
- emit('response.completed',{response:{id,status:'completed',object:'response',model:'fusion-mock',output,usage:{input_tokens:100,output_tokens:50,total_tokens:150}}});
+ emit('response.completed',{response:{id,status:'completed',object:'response',model:mockModel,output,usage:{input_tokens:100,output_tokens:50,total_tokens:150}}});
  return new Response(events.map(event=>'event: '+event.type+'\ndata: '+JSON.stringify(event)+'\n\n').join(''),{headers:{'content-type':'text/event-stream'}});
 }
 
-let serial=0;
+let serial=0,generationRequests=0;
 async function observedFetch(url,options){
- const n=++serial,start=Date.now(),b=JSON.parse(options.body),headers=options.headers;if(url.endsWith('/auto')){autoCalls++;if(b.tier!=='balance')throw Error('Wrong default tier');}else if(Object.hasOwn(b,'temperature'))throw Error('Routed temperature leaked');
+ const n=++serial,start=Date.now(),b=JSON.parse(options.body),headers=options.headers;if(url.endsWith('/auto')){autoCalls++;if(b.tier!=='balance')throw Error('Wrong default tier');}else {generationRequests++;if(Object.hasOwn(b,'temperature'))throw Error('Routed temperature leaked');if(b.max_output_tokens>mockOutputCap)throw Error('Selected-model output cap exceeded');if(b.max_output_tokens!==(noCatalog?64000:generationRequests===1?Math.min(64000,mockOutputCap):mockOutputCap))throw Error('Expected selected-model/fallback budget not used');}
  log({event:'upstream_request',n,path:new URL(url).pathname,body_keys:Object.keys(b),model:b.model,max_output_tokens:b.max_output_tokens,max_tokens:b.max_tokens,stream:b.stream,input_items:Array.isArray(b.input)?b.input.length:undefined,input_chars:JSON.stringify(b.input||'').length,reasoning:b.reasoning,headers:Object.fromEntries(Object.entries(headers).filter(([k])=>['copilot-integration-id','x-initiator','x-github-api-version','user-agent','accept','openai-intent'].includes(k)))});
  try{
  const r=await mockUpstream(url,options);log({event:'upstream_headers',n,status:r.status,ms:Date.now()-start,content_type:r.headers.get('content-type'),retry_after:r.headers.get('retry-after')});
@@ -71,7 +74,14 @@ async function observedFetch(url,options){
  }catch(e){log({event:'upstream_transport_error',n,ms:Date.now()-start,type:e.name,aborted:options.signal?.aborted});throw e}
 }
 let ingress=0,maxIngress=0,local429=0;
-const app=express();app.use((req,res,next)=>{ingress++;maxIngress=Math.max(maxIngress,ingress);const start=Date.now();let emitted=false;log({event:'proxy_ingress',path:req.path,busy:pool.authenticate(String(req.get('authorization')||'').replace(/^Bearer /i,''))?.row.busy});const done=()=>{if(emitted)return;emitted=true;ingress--;if(res.statusCode===429)local429++;log({event:'proxy_egress',path:req.path,status:res.statusCode,ms:Date.now()-start,finished:res.writableFinished})};res.once('finish',done);res.once('close',done);next()});app.use(createFusionProxy({pool,request:observedFetch}));
+const app=express();app.use((req,res,next)=>{ingress++;maxIngress=Math.max(maxIngress,ingress);const start=Date.now();let emitted=false;log({event:'proxy_ingress',path:req.path,busy:pool.authenticate(String(req.get('authorization')||'').replace(/^Bearer /i,''))?.row.busy});const done=()=>{if(emitted)return;emitted=true;ingress--;if(res.statusCode===429)local429++;log({event:'proxy_egress',path:req.path,status:res.statusCode,ms:Date.now()-start,finished:res.writableFinished})};res.once('finish',done);res.once('close',done);next()});// Catalog endpoint contract for the coordinated proxy change. The current
+// proxy snapshot does not yet expose /models; this local authenticated shim
+// tests plugin behavior without editing the other agent's checkout.
+if(!noCatalog)app.get('/api/fusion-pool/models',(req,res)=>{
+ if(!pool.authenticate(String(req.get('authorization')||'').replace(/^Bearer /i,'')))return res.sendStatus(401);
+ log({event:'synthetic_catalog',model:mockModel,max_output_tokens:mockOutputCap});
+ res.json({data:[{id:mockModel,capabilities:{limits:{max_output_tokens:mockOutputCap}}}]});
+});app.use(createFusionProxy({pool,request:observedFetch}));
 const proxy=app.listen(0,'127.0.0.1');await new Promise(r=>proxy.once('listening',r));
 const proxyURL=`http://127.0.0.1:${proxy.address().port}/api/fusion-pool`;
 let auxiliaryCalls=0, compactionCalls=0, autoCalls=0;
@@ -112,7 +122,7 @@ try {
  const large=await child(['run','--session',sid,'--server',base,'--auto','--model','copilot-fusion-direct/fusion','--format','json','Create large.html now using one write tool call. Build an ambitious polished standalone HTML canvas tower-defense game with 12 distinct towers, upgrade trees, 20 enemy types, 40 individually hand-authored wave configurations with varied squads, an illustrated SVG title screen, particles, music synthesis, touch controls, pathfinding, collision, pause, shop and save/load. Include complete detailed CSS, all inline JS and every level and item description, a tutorial, tooltip explanations, game over and victory screens. No external dependencies, no placeholders, no TODOs. Do not use a shell generator: write complete working source code in one write call. Start with implementation and keep writing the complete file. Do not inspect credentials or environment. No deployment.'],'large.log',360000);
  if(large.code!==0||!fs.existsSync(path.join(project,'large.html')))throw new Error('Large mock file write did not complete');
  if(local429!==0||autoCalls!==2||compactionCalls!==1||auxiliaryCalls<2)throw new Error('Sticky/auxiliary/reanchor assertions failed');
- log({event:'transport_summary',max_concurrent_ingress:maxIngress,local_429:local429,large_file_bytes:fs.statSync(path.join(project,'large.html')).size,auto_calls:autoCalls,auxiliary_calls:auxiliaryCalls,compaction_calls:compactionCalls,upstream:'synthetic; not live acceptance evidence'});
+ log({event:'transport_summary',max_concurrent_ingress:maxIngress,local_429:local429,large_file_bytes:fs.statSync(path.join(project,'large.html')).size,selected_model:mockModel,selected_output_cap:mockOutputCap,metadata:noCatalog?'legacy-proxy-fallback':'synthetic-catalog-shim',auto_calls:autoCalls,auxiliary_calls:auxiliaryCalls,compaction_calls:compactionCalls,upstream:'synthetic; not live acceptance evidence'});
  log({event:'large_result',code:large.code,timed:large.timed,file_exists:fs.existsSync(path.join(project,'large.html')),length_error:large.data.split('\n').some(line=>{try{const event=JSON.parse(line);return event.type==='error'&&/output token limit|stop reason: length|truncated/.test(JSON.stringify(event.error))}catch{return false}}),compaction:/compaction/i.test(large.data)});
 }}catch(e){log({event:'test_error',name:e.name,message:e.message});process.exitCode=1}
 finally{pool.end('local-diagnostic-only');for(const c of children)c.kill('SIGTERM');await delay(1000);for(const c of children)c.kill('SIGKILL');proxy.closeAllConnections();await new Promise(r=>proxy.close(r));auxiliaryServer.closeAllConnections();await new Promise(r=>auxiliaryServer.close(r));fs.writeFileSync(path.join(out,'server.log'),clean(serverLog));delete env.FUSION_ACCESS_TOKEN;delete env.OPENCODE_PASSWORD;delete process.env.FUSION_TEST_CONTRIBUTOR_TOKEN;let secretFiles=0;const walk=d=>{for(const entry of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,entry.name);if(entry.isDirectory())walk(p);else if(entry.isFile()&&fs.statSync(p).size<50000000){const b=fs.readFileSync(p);if(b.includes(Buffer.from(token))||b.includes(Buffer.from(capability))||b.includes(Buffer.from(password)))secretFiles++}}};walk(out);log({event:'cleanup',credentials:'process memory released',credential_files_found:secretFiles});if(secretFiles)process.exitCode=1;}

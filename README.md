@@ -105,11 +105,23 @@ FUSION_PROXY_REPOSITORY=/workspace/omsite node scripts/test-opencode-v2.mjs /wor
 
 Assertions cover title bypass, simple/large writes, sticky tool follow-ups, compaction bypass and re-anchoring, no local 429s, and exactly three failed auxiliary compaction attempts before the existing runner policy stops retries. Synthetic transport success is **not** evidence of real large-generation quality or the live free endpoint's availability.
 
-## Output budget
+## Selected-model output budget
 
-`FUSION_OUTPUT_LIMIT` is a single named constant, currently **128000**. This follows the separately authorized 2026-11-06 probe: the selected `mai-code-1.1-flash` catalog advertised 128000 output tokens and `/responses` accepted/reported that requested budget. Those short responses prove parameter acceptance, not reliable sustained 128k generation or support by every possible Fusion-selected model.
+After `/auto`, the plugin uses **that exact selected model's** `capabilities.limits.max_output_tokens` from the models inventory. A proxy may attach the inventory's `capabilities.limits`/`limits` to `selected_model`; otherwise the plugin reads `GET {FUSION_UPSTREAM}/models` with the same credential. It never sends a pool run credential directly to Copilot. Catalog reads are cached and single-flighted, and reset on credential rotation.
 
-The existing conservative 48000 input-token window stays unchanged. Client context metadata reserves input plus output (176000) so the larger output allowance does not create an always-overfull compaction budget. Title output is capped at 512; other auxiliaries at 8000. Keep the runner's chunked-write guidance and bounded-compaction companion plugin installed.
+The actual outgoing `max_output_tokens` is clamped to the selected model's cap, so a known lower-limit model never inherits the 128000 cap from another model. The provider's `limit.output` metadata is refreshed after selection too. Smaller request budgets are retained. The initial metadata bootstrap is replaced by the selected cap for subsequent provider requests; an already-created smaller request keeps its budget.
+
+`FUSION_OUTPUT_LIMIT=64000` is the explicitly approved **fallback only** when catalog metadata is unavailable. The 2026-11-06 authorized catalog/probe reports show 128000 for observed `gpt-6-luna`, `gpt-5.6-luna` variants and `mai-code-1.1-flash`. This does not establish a universal floor for every future Fusion model: expose model metadata in the pool proxy rather than relying on the fallback. An older proxy without metadata stays compatible at the fallback (`--no-models` in the integration harness tests this path).
+
+The existing conservative 48000 input-token window stays unchanged. Client context metadata reserves input plus the current output cap so increasing the allowance does not create an always-overfull compaction budget. Title output is capped at 512; other auxiliaries at 8000. Keep the runner's chunked-write guidance and bounded-compaction companion plugin installed.
+
+The integration harness includes a local, authenticated `/models` metadata shim until the separately coordinated proxy endpoint/enrichment is available. To test a lower-limit selection without actual inference:
+
+```sh
+FUSION_SYNTHETIC_MODEL=luna-synthetic-low-limit FUSION_SYNTHETIC_OUTPUT_LIMIT=16384 node scripts/test-opencode-v2.mjs /workspace/fusion-oc2-diagnostic UNIQUE_LOW_LIMIT_RUN
+```
+
+16384 here is a deliberately lower **synthetic** cap, not Luna's real catalog limit. Short real parameter-acceptance probes and synthetic large writes do not prove reliable sustained large generation.
 
 ## Limits
 
