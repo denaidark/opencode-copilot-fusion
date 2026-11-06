@@ -46,13 +46,16 @@ Alternatively, set `FUSION_ACCESS_TOKEN` directly. Do not commit either value.
 
 ## Select the model
 
-Select `copilot-fusion-direct/fusion`, or keep it as the `model` in `opencode.json`. The plugin routes with Intelligence by default.
+Select `copilot-fusion-direct/fusion`, or keep it as the `model` in `opencode.json`. The plugin routes with Fusion Standard (`balance`) by default.
 
 ## How it works
 
 - The plugin adds the `copilot-fusion-direct` provider and a tools-capable model named `fusion`.
-- On each model request it calls `POST /auto` with `fusion: true` and `tier: intelligence`.
-- It caches the selected model and Fusion session token by OpenCode session plus prompt hash.
+- The first primary request calls `POST /auto` with `fusion: true` and `tier: balance`.
+- The selected model and Fusion session token are sticky per conversation, including new user prompts. Concurrent requests share one `/auto` call; follow-ups use `X-Initiator: agent`.
+- Compaction, credential rotation, failed inference, expiry, or an image requiring a vision-capable model reset the route. During refresh, `/auto` 429/5xx responses reuse the previous route only while it is still valid and compatible.
+- Title, generate, and compaction requests never call `/auto` or use the shared pool. They use the runner's free `deepseek-v4.1-flash-free` model via OpenCode Console's documented Responses endpoint (all text models support it). Original hook identity, request cancellation, HTTP errors and `Retry-After` remain available to the runner's compaction budget.
+- Routed primary requests omit `temperature`, which some selected models reject.
 - It forwards the original Responses payload, including tools and tool results, to `/responses`.
 - It executes no tools. OpenCode runs its native tools and sends their results back through the same route.
 - It stabilizes opaque item IDs across streamed Responses events.
@@ -68,14 +71,16 @@ Pass options through the plugin entry when needed:
       "package": "git+https://github.com/OMGDemoPlayground/opencode-copilot-fusion.git#v0.1.2",
       "options": {
         "tokenFile": "/absolute/path/to/tokens.json",
-        "tier": "intelligence"
+        "tier": "balance"
       }
     }
   ]
 }
 ```
 
-Supported options: `tokenFile`, `upstream`, `tier`, and `timeoutMs`. Environment equivalents are `FUSION_TOKEN_FILE`, `FUSION_ACCESS_TOKEN`, `FUSION_UPSTREAM`, and `FUSION_TIER`.
+Supported options: `tokenFile`, `upstream`, `tier`, `timeoutMs`, `auxiliaryUpstream`, `auxiliaryModel`, and `auxiliaryApiKey`. Environment equivalents are `FUSION_TOKEN_FILE`, `FUSION_ACCESS_TOKEN`, `FUSION_UPSTREAM`, `FUSION_TIER`, `FUSION_AUXILIARY_UPSTREAM`, `FUSION_AUXILIARY_MODEL`, and `FUSION_AUXILIARY_API_KEY`.
+
+`FUSION_UPSTREAM` may be the shared-pool proxy prefix and `FUSION_ACCESS_TOKEN` its run credential. Auxiliary calls use a separate endpoint (default `https://opencode.ai/inference/openai/v1`) and a separate API key (default `public`). **Fusion credentials, cookies, and encrypted reasoning are never forwarded there.** Auxiliary input preserves conversational text and tool-call/result history; these calls do not execute tools or transfer image data. The genuine OpenCode User-Agent/client headers are retained, since free chat models require OpenCode. If your deployment uses a different free-model endpoint, configure the auxiliary options explicitly.
 
 ## Release assets
 
@@ -88,6 +93,23 @@ bun install
 bun test
 bun run typecheck
 ```
+
+## OpenCode v2 integration harness
+
+The repeatable credential-free harness reuses `/workspace/fusion-oc2-diagnostic/bin/opencode` (v2.2.5) and a local instance of the pool proxy with a synthetic upstream. It does not launch Actions, create production runs, read contributor tokens, or call real inference:
+
+```sh
+FUSION_PROXY_REPOSITORY=/workspace/omsite node scripts/test-opencode-v2.mjs /workspace/fusion-oc2-diagnostic UNIQUE_RUN_NAME
+FUSION_PROXY_REPOSITORY=/workspace/omsite node scripts/test-opencode-v2.mjs /workspace/fusion-oc2-diagnostic UNIQUE_FAILURE_RUN_NAME --fail-compaction
+```
+
+Assertions cover title bypass, simple/large writes, sticky tool follow-ups, compaction bypass and re-anchoring, no local 429s, and exactly three failed auxiliary compaction attempts before the existing runner policy stops retries. Synthetic transport success is **not** evidence of real large-generation quality or the live free endpoint's availability.
+
+## Output budget
+
+`FUSION_OUTPUT_LIMIT` is a single named constant, currently **128000**. This follows the separately authorized 2026-11-06 probe: the selected `mai-code-1.1-flash` catalog advertised 128000 output tokens and `/responses` accepted/reported that requested budget. Those short responses prove parameter acceptance, not reliable sustained 128k generation or support by every possible Fusion-selected model.
+
+The existing conservative 48000 input-token window stays unchanged. Client context metadata reserves input plus output (176000) so the larger output allowance does not create an always-overfull compaction budget. Title output is capped at 512; other auxiliaries at 8000. Keep the runner's chunked-write guidance and bounded-compaction companion plugin installed.
 
 ## Limits
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   FusionRouter,
+  FUSION_OUTPUT_LIMIT,
   MODEL_ID,
   PROVIDER_ID,
   buildUpstreamRequest,
@@ -32,7 +33,7 @@ const router = (fetchImpl: FetchImpl, now = () => 1_000) =>
   new FusionRouter({ token: "oauth-token", fetchImpl, now, timeoutMs: 1_000 })
 
 describe("Fusion routing", () => {
-  test("sends an intelligence anchor and caches by session and prompt", async () => {
+  test("sends a Standard anchor and stays sticky across session prompts", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = []
     const instance = router(async (url, init) => {
       calls.push({ url: String(url), init: init ?? {} })
@@ -44,13 +45,13 @@ describe("Fusion routing", () => {
     await instance.route("session-b", "Build app")
 
     expect(first).toEqual(second)
-    expect(calls).toHaveLength(3)
+    expect(calls).toHaveLength(2)
     expect(calls[0].url).toBe("https://api.githubcopilot.com/auto")
     expect(calls[0].init.body).toBe(JSON.stringify({
       prompt: "Build app",
       has_image: false,
       multi_turn: { routing_intent: "anchor", turns_since_anchor: 0 },
-      tier: "intelligence",
+      tier: "balance",
       hydra_rl_multi_turn: {},
       fusion: true,
     }))
@@ -92,9 +93,8 @@ describe("Fusion routing", () => {
   })
 
   test("computes a stable route key", () => {
-    expect(routeKey("a", "hi")).toBe(routeKey("a", "hi"))
-    expect(routeKey("a", "hi")).not.toBe(routeKey("b", "hi"))
-    expect(routeKey("a", "hi", true)).not.toBe(routeKey("a", "hi", false))
+    expect(routeKey("a")).toBe(routeKey("a"))
+    expect(routeKey("a")).not.toBe(routeKey("b"))
   })
 
   test("routes image requests with has_image and rejects non-vision routes", async () => {
@@ -112,6 +112,86 @@ describe("Fusion routing", () => {
     })))
     await expect(noVision.route("session", "Read image", true)).rejects.toThrow("image input")
   })
+  test("single-flights parallel prompts and claims only one user anchor", async () => {
+    let calls = 0
+    const instance = router(async () => {
+      calls++
+      await Bun.sleep(10)
+      return Response.json(route())
+    })
+    const values = await Promise.all(Array.from({ length: 10 }, (_, n) => instance.route("same", `prompt ${n}`)))
+    expect(calls).toBe(1)
+    expect(values.every(value => value === values[0])).toBe(true)
+    expect(values.map(value => instance.reuse(value))).toEqual([false, ...Array(9).fill(true)])
+  })
+
+  test("reroutes after compaction, failure invalidation, expiry and credential rotation", async () => {
+    let now = 1000, calls = 0
+    const instance = router(async () => { calls++; return Response.json(route(`model-${calls}`, now + 100)) }, () => now)
+    await instance.route("s", "one")
+    instance.invalidateSession("s")
+    await instance.route("s", "two")
+    expect(calls).toBe(2)
+    now += 101
+    await instance.route("s", "three")
+    expect(calls).toBe(3)
+    instance.setToken("new-token")
+    await instance.route("s", "four")
+    expect(calls).toBe(4)
+  })
+
+  test("soft-fails /auto 429 and 5xx only while the last good route remains valid", async () => {
+    for (const status of [429, 500, 502, 503]) {
+      let now = 1000, calls = 0
+      const instance = router(async () => ++calls === 1 ? Response.json(route("good", 1100)) : new Response("failed", { status }), () => now)
+      const first = await instance.route("s", "one")
+      now = 1080 // refresh window, but token still valid
+      expect(await instance.route("s", "two")).toBe(first)
+      now = 1101
+      await expect(instance.route("s", "three")).rejects.toThrow(`HTTP ${status}`)
+    }
+  })
+
+  test("never masks auth failures and never reuses non-vision routes for image input", async () => {
+    let status = 200, now = 1000
+    const instance = router(async () => status === 200 ? Response.json({ ...route("text", 1100), selected_model: { id: "text", supported_endpoints: ["/responses"], vision: false } }) : new Response("failed", { status }), () => now)
+    await instance.route("s", "one")
+    status = 429
+    await expect(instance.route("s", "image", true)).rejects.toThrow("HTTP 429")
+    now = 1080; status = 403
+    await expect(instance.route("s", "two")).rejects.toThrow("HTTP 403")
+  })
+
+  test("image input joining a text-only flight reroutes safely", async () => {
+    let calls = 0
+    const instance = router(async (_url, init) => {
+      calls++
+      await Bun.sleep(5)
+      const vision = JSON.parse(String(init?.body)).has_image
+      return Response.json({ ...route(), selected_model: { id: vision ? "vision" : "text", supported_endpoints: ["/responses"], vision } })
+    })
+    const [plain, image] = await Promise.all([instance.route("s", "hi"), instance.route("s", "photo", true)])
+    expect(plain.selected_model.id).toBe("text")
+    expect(image.selected_model.id).toBe("vision")
+    expect(calls).toBe(2)
+  })
+
+  test("invalidating an inflight route cannot repopulate the cache", async () => {
+    let finish!: () => void
+    const instance = router(async () => { await new Promise<void>(resolve => { finish = resolve }); return Response.json(route()) })
+    const pending = instance.route("s", "hi")
+    instance.invalidateSession("s")
+    finish()
+    await pending
+    expect(instance.routes.size).toBe(0)
+  })
+
+  test("bounds the route cache", async () => {
+    const instance = new FusionRouter({ token: "test", maxRoutes: 2, now: () => 1000, fetchImpl: async () => Response.json(route()) })
+    await instance.route("a", "hi"); await instance.route("b", "hi"); await instance.route("c", "hi")
+    expect([...instance.routes.keys()]).toEqual(["b", "c"])
+  })
+
 })
 
 describe("request preparation", () => {
@@ -148,9 +228,10 @@ describe("request preparation", () => {
 
   test("preserves tools and adds encrypted reasoning", () => {
     const tools = [{ type: "function", name: "write" }]
-    const prepared = prepareResponsesBody({ model: "fusion", input: "hi", tools, include: [] }, route())
+    const prepared = prepareResponsesBody({ model: "fusion", input: "hi", tools, include: [], temperature: 0.4 }, route())
     expect(prepared.model).toBe("selected-model")
     expect(prepared.store).toBe(false)
+    expect(prepared).not.toHaveProperty("temperature")
     expect(prepared.tools).toEqual(tools)
     expect(prepared.include).toEqual(["reasoning.encrypted_content"])
   })
@@ -194,6 +275,13 @@ describe("stream normalization", () => {
     expect(normalizeSseFrame(["data: [DONE]"], slots)).toBe("data: [DONE]")
   })
 
+  test("observes terminal streaming failures without changing their wire", () => {
+    let failures = 0
+    const frame = ['data: {"type":"response.failed","response":{"status":"failed"}}']
+    expect(normalizeSseFrame(frame, new Map(), () => failures++)).toContain('"status":"failed"')
+    expect(failures).toBe(1)
+  })
+
   test("normalizes SSE across arbitrary chunk boundaries", async () => {
     const wire = [
       'event: response.output_item.added\ndata: {"output_index":0,"item":{"id":"one"}}\n\n',
@@ -233,6 +321,10 @@ describe("provider registration", () => {
     expect(added[0].models[0].capabilities.tools).toBe(true)
     expect(added[0].models[0].capabilities.input).toContain("image")
     expect(added[0].models[0].id).toBe(MODEL_ID)
+    expect(modelInfo().limit.output).toBe(FUSION_OUTPUT_LIMIT)
+    expect(FUSION_OUTPUT_LIMIT).toBe(128_000)
+    expect(modelInfo().limit.context).toBeGreaterThanOrEqual(modelInfo().limit.input + modelInfo().limit.output)
+    expect(modelInfo().name).toBe("Fusion Standard")
     expect(added[0].info.id).toBe(PROVIDER_ID)
   })
 })

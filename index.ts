@@ -10,14 +10,15 @@ import {
   extractInput,
   normalizeHttpResponse,
   prepareResponsesBody,
-  routeKey,
   upsertProvider,
   type ProviderEditor,
 } from "./src/fusion"
 
+import { buildAuxiliaryRequest, DEFAULT_AUXILIARY_MODEL, DEFAULT_AUXILIARY_UPSTREAM, isAuxiliary, type RequestKind } from "./src/auxiliary"
+
 type ProviderRef = { providerID: string }
-type RequestEvent = { sessionID: string; model: ProviderRef; request: Request }
-type ResponseEvent = { sessionID: string; model: ProviderRef; request: Request; response: Response }
+type RequestEvent = { kind?: RequestKind; sessionID: string; model: ProviderRef; request: Request }
+type ResponseEvent = { kind?: RequestKind; sessionID: string; model: ProviderRef; request: Request; response: Response }
 type HookOptions = { providerID?: string }
 
 type Context = {
@@ -25,6 +26,7 @@ type Context = {
   readonly location: { readonly directory: string }
   readonly provider: { transform(editor: (value: ProviderEditor) => void): Promise<unknown> }
   readonly session: {
+    hook(name: "compaction", callback: (event: { sessionID: string; model: ProviderRef }) => Promise<void> | void, options?: HookOptions): Promise<unknown>
     hook(name: "http.request", callback: (event: RequestEvent) => Promise<void> | void, options?: HookOptions): Promise<unknown>
     hook(name: "http.response", callback: (event: ResponseEvent) => Promise<void> | void, options?: HookOptions): Promise<unknown>
   }
@@ -46,6 +48,10 @@ const plugin = {
     const options = context.options ?? {}
     const upstream = stringOption(options, "upstream") ?? process.env.FUSION_UPSTREAM ?? DEFAULT_UPSTREAM
     const tier = stringOption(options, "tier") ?? process.env.FUSION_TIER ?? DEFAULT_TIER
+    const auxiliaryUpstream = stringOption(options, "auxiliaryUpstream") ?? process.env.FUSION_AUXILIARY_UPSTREAM ?? DEFAULT_AUXILIARY_UPSTREAM
+    const auxiliaryModel = stringOption(options, "auxiliaryModel") ?? process.env.FUSION_AUXILIARY_MODEL ?? DEFAULT_AUXILIARY_MODEL
+    // Deliberately separate from FUSION_ACCESS_TOKEN (which may be a pool run credential).
+    const auxiliaryApiKey = stringOption(options, "auxiliaryApiKey") ?? process.env.FUSION_AUXILIARY_API_KEY
     const timeoutMs = numberOption(options, "timeoutMs") ?? 120_000
     const configured = stringOption(options, "tokenFile") ?? process.env.FUSION_TOKEN_FILE
     const tokenFile = configured
@@ -68,6 +74,9 @@ const plugin = {
 
     router.setToken(await token())
     await context.provider.transform((editor) => upsertProvider(editor, upstream))
+    await context.session.hook("compaction", event => {
+      if (event.model.providerID === PROVIDER_ID) router.invalidateSession(event.sessionID)
+    }, { providerID: PROVIDER_ID })
     await context.session.hook(
       "http.request",
       async (event) => {
@@ -79,9 +88,13 @@ const plugin = {
           return
         }
         if (typeof body !== "object" || body === null || (body as { model?: unknown }).model !== MODEL_ID) return
+        if (isAuxiliary(event.kind)) {
+          event.request = buildAuxiliaryRequest(event.request, body as Record<string, unknown>, {
+            upstream: auxiliaryUpstream, model: auxiliaryModel, apiKey: auxiliaryApiKey, kind: event.kind,
+          })
+          return
+        }
         const input = extractInput(body)
-        const known = router.routes.get(routeKey(event.sessionID, input.prompt, input.hasImage))
-        const reused = known !== undefined && known.expires_at > Date.now() / 1000 + 30
         const currentToken = await token()
         router.setToken(currentToken)
         const route = await router.route(event.sessionID, input.prompt, input.hasImage)
@@ -92,7 +105,7 @@ const plugin = {
           currentToken,
           upstream,
           event.sessionID,
-          reused,
+          router.reuse(route),
         )
       },
       { providerID: PROVIDER_ID },
@@ -101,7 +114,12 @@ const plugin = {
       "http.response",
       async (event) => {
         if (event.model.providerID !== PROVIDER_ID) return
-        event.response = await normalizeHttpResponse(event.response)
+        if (isAuxiliary(event.kind)) {
+          event.response = await normalizeHttpResponse(event.response)
+          return
+        }
+        if (!event.response.ok) router.invalidateSession(event.sessionID)
+        event.response = await normalizeHttpResponse(event.response, () => router.invalidateSession(event.sessionID))
       },
       { providerID: PROVIDER_ID },
     )

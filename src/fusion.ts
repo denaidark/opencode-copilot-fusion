@@ -1,9 +1,13 @@
-import { createHash } from "node:crypto"
-
 export const PROVIDER_ID = "copilot-fusion-direct"
 export const MODEL_ID = "fusion"
 export const DEFAULT_UPSTREAM = "https://api.githubcopilot.com"
-export const DEFAULT_TIER = "intelligence"
+export const DEFAULT_TIER = "balance"
+// Igor-authorized 2026-11-06 probe: selected mai-code-1.1-flash catalog and
+// /responses both report 128000. Parameter acceptance is not sustained-output evidence.
+export const FUSION_OUTPUT_LIMIT = 128_000
+// Preserve the existing conservative input window; reserve output separately so
+// increasing the output cap cannot make OpenCode compact every turn.
+export const FUSION_INPUT_LIMIT = 48_000
 
 export class FusionError extends Error {}
 
@@ -128,11 +132,12 @@ export function prepareResponsesBody(body: Record<string, unknown>, route: Fusio
     ? body.include.filter((value): value is string => typeof value === "string")
     : []
   if (!include.includes("reasoning.encrypted_content")) include.push("reasoning.encrypted_content")
-  return { ...body, model: route.selected_model.id, store: false, include }
+  const { temperature: _temperature, ...rest } = body
+  return { ...rest, model: route.selected_model.id, store: false, include }
 }
 
-export function routeKey(sessionID: string, prompt: string, hasImage = false): string {
-  return `${sessionID}:${hasImage ? 1 : 0}:${createHash("sha256").update(prompt).digest("hex")}`
+export function routeKey(sessionID: string): string {
+  return sessionID
 }
 
 export class FusionRouter {
@@ -144,6 +149,8 @@ export class FusionRouter {
   readonly now: () => number
   readonly routes = new Map<string, FusionRoute>()
   private token: string
+  private readonly inflight = new Map<string, Promise<FusionRoute>>()
+  private used = new WeakSet<FusionRoute>()
 
   constructor(options: RouterOptions) {
     this.token = options.token
@@ -156,19 +163,61 @@ export class FusionRouter {
   }
 
   setToken(token: string) {
+    if (this.token !== token) this.clear()
     this.token = token
   }
 
   clear() {
     this.routes.clear()
+    // Detached /auto calls may finish, but cannot repopulate this cache.
+    this.inflight.clear()
+    this.used = new WeakSet()
+  }
+
+  invalidateSession(sessionID: string) {
+    this.routes.delete(routeKey(sessionID))
+    this.inflight.delete(routeKey(sessionID))
+  }
+
+  /** Claim the anchor exactly once, including callers joining the same /auto flight. */
+  reuse(route: FusionRoute): boolean {
+    const reused = this.used.has(route)
+    this.used.add(route)
+    return reused
   }
 
   async route(sessionID: string, prompt: string, hasImage = false): Promise<FusionRoute> {
-    const key = routeKey(sessionID, prompt, hasImage)
+    const key = routeKey(sessionID)
     this.prune()
+    const pending = this.inflight.get(key)
+    if (pending) {
+      const selected = await pending
+      // An image arriving during a text-only flight must not inherit a non-vision pick.
+      return hasImage && selected.selected_model.vision !== true
+        ? this.route(sessionID, prompt, true)
+        : selected
+    }
     const cached = this.routes.get(key)
-    if (cached) return cached
+    const compatible = !hasImage || cached?.selected_model.vision === true
+    if (cached && compatible && cached.expires_at > this.now() + 30) return cached
 
+    const promise = this.select(sessionID, prompt, hasImage, compatible ? cached : undefined).then(route => {
+      if (this.inflight.get(key) === promise) {
+        if (this.routes.size >= this.maxRoutes && !this.routes.has(key)) {
+          const oldest = this.routes.keys().next().value
+          if (oldest !== undefined) this.routes.delete(oldest)
+        }
+        this.routes.set(key, route)
+      }
+      return route
+    }).finally(() => {
+      if (this.inflight.get(key) === promise) this.inflight.delete(key)
+    })
+    this.inflight.set(key, promise)
+    return promise
+  }
+
+  private async select(sessionID: string, prompt: string, hasImage: boolean, previous?: FusionRoute): Promise<FusionRoute> {
     const response = await this.fetchImpl(`${this.upstream}/auto`, {
       method: "POST",
       headers: this.headers(sessionID),
@@ -182,7 +231,16 @@ export class FusionRouter {
       }),
       signal: AbortSignal.timeout(this.timeoutMs),
     })
-    if (!response.ok) throw new FusionError(`Copilot /auto returned HTTP ${response.status}`)
+    if (!response.ok) {
+      // A short transient failure while refreshing must not break a still-valid conversation.
+      // Never reuse expired, explicitly invalidated, or non-vision routes for image input.
+      if ((response.status === 429 || response.status >= 500) && previous && previous.expires_at > this.now()) {
+        await response.body?.cancel().catch(() => {})
+        return previous
+      }
+      await response.body?.cancel().catch(() => {})
+      throw new FusionError(`Copilot /auto returned HTTP ${response.status}`)
+    }
     const value = await response.json().catch(() => {
       throw new FusionError("Copilot /auto returned invalid JSON")
     })
@@ -221,16 +279,11 @@ export class FusionRouter {
     if (route.expires_at <= this.now() + 30) {
       throw new FusionError("Fusion returned no valid expiry")
     }
-    if (this.routes.size >= this.maxRoutes) {
-      const oldest = this.routes.keys().next().value
-      if (oldest !== undefined) this.routes.delete(oldest)
-    }
-    this.routes.set(key, route)
     return route
   }
 
   private prune() {
-    const threshold = this.now() + 30
+    const threshold = this.now()
     for (const [key, route] of this.routes) if (route.expires_at <= threshold) this.routes.delete(key)
   }
 
@@ -312,7 +365,7 @@ export function stableEvent(event: Record<string, unknown>, slots: Map<number, I
   return event
 }
 
-export function normalizeSseFrame(lines: string[], slots: Map<number, IdSlot>): string {
+export function normalizeSseFrame(lines: string[], slots: Map<number, IdSlot>, onFailure?: () => void): string {
   const data = lines
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).replace(/^ /, ""))
@@ -323,13 +376,14 @@ export function normalizeSseFrame(lines: string[], slots: Map<number, IdSlot>): 
     const parsed: unknown = JSON.parse(data)
     if (!isRecord(parsed)) return lines.join("\n")
     event = stableEvent(parsed, slots)
+    if (event.type === "error" || event.type === "response.failed") onFailure?.()
   } catch {
     return lines.join("\n")
   }
   return [...lines.filter((line) => !line.startsWith("data:")), `data: ${JSON.stringify(event)}`].join("\n")
 }
 
-export function createStableSseStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+export function createStableSseStream(body: ReadableStream<Uint8Array>, onFailure?: () => void): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   const slots = new Map<number, IdSlot>()
@@ -337,7 +391,7 @@ export function createStableSseStream(body: ReadableStream<Uint8Array>): Readabl
   let frame: string[] = []
   const emit = (controller: TransformStreamDefaultController<Uint8Array>) => {
     if (frame.length === 0) return
-    controller.enqueue(encoder.encode(`${normalizeSseFrame(frame, slots)}\n\n`))
+    controller.enqueue(encoder.encode(`${normalizeSseFrame(frame, slots, onFailure)}\n\n`))
     frame = []
   }
   const line = (value: string, controller: TransformStreamDefaultController<Uint8Array>) => {
@@ -365,14 +419,14 @@ export function createStableSseStream(body: ReadableStream<Uint8Array>): Readabl
   )
 }
 
-export async function normalizeHttpResponse(response: Response): Promise<Response> {
+export async function normalizeHttpResponse(response: Response, onFailure?: () => void): Promise<Response> {
   if (!response.ok || response.status === 204 || response.status === 304 || !response.body) return response
   const headers = new Headers(response.headers)
   headers.delete("content-length")
   headers.delete("content-encoding")
   if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
     headers.set("cache-control", "no-cache")
-    return new Response(createStableSseStream(response.body), { status: response.status, headers })
+    return new Response(createStableSseStream(response.body, onFailure), { status: response.status, headers })
   }
   if (!(response.headers.get("content-type") ?? "").includes("application/json")) return response
   const text = await response.clone().text()
@@ -382,7 +436,10 @@ export async function normalizeHttpResponse(response: Response): Promise<Respons
   } catch {
     return response
   }
-  if (isRecord(value)) stableEvent({ response: value }, new Map())
+  if (isRecord(value)) {
+    stableEvent({ response: value }, new Map())
+    if (value.status === "failed" || value.error) onFailure?.()
+  }
   return new Response(JSON.stringify(value), { status: response.status, headers })
 }
 
@@ -401,7 +458,7 @@ export function modelInfo(): ModelInfo {
     id: MODEL_ID,
     modelID: MODEL_ID,
     providerID: PROVIDER_ID,
-    name: "Fusion Intelligence",
+    name: "Fusion Standard",
     package: "@opencode/ai/providers/openai/responses",
     capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
     variants: [],
@@ -409,7 +466,7 @@ export function modelInfo(): ModelInfo {
     cost: [],
     status: "active",
     enabled: true,
-    limit: { context: 64_000, input: 48_000, output: 8_000 },
+    limit: { context: FUSION_INPUT_LIMIT + FUSION_OUTPUT_LIMIT, input: FUSION_INPUT_LIMIT, output: FUSION_OUTPUT_LIMIT },
   }
 }
 
